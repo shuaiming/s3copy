@@ -65,10 +65,10 @@ def _GET_CHUNK_SIZE(file_size):
     elif file_size <= 25 * GB:
         chunk_size = MIN_CHUNK_SIZE
     elif file_size <= 250 * GB:
-        chunks_size = 50 * MB
+        chunk_size = 50 * MB
     elif file_size <= 1 * TB:
         chunk_size = 125 * MB
-    else:                      # size: 1T -5T,      parts: 2000 - 10000
+    else:
         chunk_size = MAX_CHUNK_SIZE
 
     LOGGER.info("set chunk_size to %s" % chunk_size)
