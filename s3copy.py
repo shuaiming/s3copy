@@ -12,6 +12,7 @@
 import os
 import re
 import sys
+import time
 import boto3
 import shutil
 import logging
@@ -28,21 +29,49 @@ LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(logging.DEBUG)
 LOGGER.addHandler(SysLogHandler(address='/dev/log'))
 
-MB = 1024*1024
 PREFIX_S3 = 's3://'
+
+KB = 1024
+MB = 1024 * KB
+GB = 1024 * MB
+TB = 1024 * GB
+
 # s3 largest file size is 5T
 # and PartNumber is a positive integer between 1 and 10,000
 # https://aws.amazon.com/blogs/aws/amazon-s3-object-size-limit/
 # http://boto3.readthedocs.org/en/latest/reference/services/s3.html
 # MAX_CHUNK_SIZE is safe setting to 5T / 10000?
-MAX_CHUNK_SIZE = 500*MB
-MIN_CHUNK_SIZE = 5*MB
+# Each part must be at least 5 MB in size, except the last part.
+MIN_CHUNK_SIZE = 5 * MB
+MAX_CHUNK_SIZE = 500 * MB
+MAX_S3_FILE_SIZE = 5 * TB
 
 
 def _GET_CHUNK_SIZE(file_size):
-    chunk_size = max(MIN_CHUNK_SIZE,
-                     min(MAX_CHUNK_SIZE, int(file_size/5000)))
-    LOGGER.debug("set chunk_size to %s" % chunk_size)
+    """
+    +------------+------------+---------------+
+    | file_size  | chunk_size | parts         |
+    +------------+------------+---------------+
+    | < 500M     | file_size  | no Multipart  |
+    | 500M - 25G | 5M         | 100 - 5000    |
+    | 25G - 250G | 50M        | 500 - 5000    |
+    | 250G - 1T  | 125M       | 2000 - 8000   |
+    | 1T - 5T    | 500M       | 2000 - 10000  |
+    +------------+------------+---------------+
+    """
+    assert file_size <= 5 * TB
+    if file_size <= 500 * MB:
+        chunk_size = file_size
+    elif file_size <= 25 * GB:
+        chunk_size = MIN_CHUNK_SIZE
+    elif file_size <= 250 * GB:
+        chunks_size = 50 * MB
+    elif file_size <= 1 * TB:
+        chunk_size = 125 * MB
+    else:                      # size: 1T -5T,      parts: 2000 - 10000
+        chunk_size = MAX_CHUNK_SIZE
+
+    LOGGER.info("set chunk_size to %s" % chunk_size)
     return chunk_size
 
 
@@ -63,7 +92,6 @@ class FileChunkReader(object):
                 self._file_handler.seek(starter)
                 data = self._file_handler.read(size)
                 rlock.release()
-            # TODO, callback here
             return data
 
         assert((starter / float(self._chunk_size)) % 1 == 0)
@@ -95,8 +123,8 @@ class FileChunkWriter(object):
         self._file_size = size
         self._chunk_size = _GET_CHUNK_SIZE(self._file_size)
         self._file_handler = open("%s.download" % self._filename, 'wb')
-        # self._file_handler.seek(self._file_size - 1)
-        # self._file_handler.write('\0')
+        self._file_handler.seek(self._file_size - 1)
+        self._file_handler.write('\0')
 
         self._chunks = []
         self._gen_chunks()
@@ -108,7 +136,6 @@ class FileChunkWriter(object):
                 self._file_handler.seek(starter)
                 self._file_handler.write(data)
                 rlock.release()
-            # TODO, callback here
 
         range_param = 'bytes=%s-%s' % (starter, starter + size - 1)
         writer = namedtuple('Writer', 'write range_param size')
@@ -193,24 +220,29 @@ class FileTransfer(object):
 
     def _download_one_part(self, bucket, key, extra_args):
         def _do_download(chunk):
+            t = 1  # sleep time 1,2,4,8,16...120
             for r in range(0, 10):
-                response = self.client.get_object(
-                    Bucket=bucket, Key=key,
-                    Range=chunk.range_param, **extra_args)
-                if response['ResponseMetadata']['HTTPStatusCode'] \
-                        is not 206:
+                try:
+                    response = self.client.get_object(
+                        Bucket=bucket, Key=key,
+                        Range=chunk.range_param, **extra_args)
+                    data = response['Body'].read()
+                    assert len(data) == chunk.size
+                    chunk.write(data)
+
+                    self._add_finished_size(chunk.size)
+                    LOGGER.debug("download %s %s" % (key, chunk.range_param))
+
+                    if self._progress:
+                        self._callback(self._total_size, self._finished_size)
+
+                    return True
+                except:
+                    LOGGER.warn("retry %s part %s, %s of %s" % (
+                            key, chunk.range_param, r+1, self._retry))
+                    self._sleep_with(t)
+                    t = t + 1
                     continue
-                data = response['Body'].read()
-                assert len(data) == chunk.size
-                chunk.write(data)
-
-                self._add_finished_size(chunk.size)
-                LOGGER.debug("download %s %s" % (key, chunk.range_param))
-
-                if self._progress:
-                    self._callback(self._total_size, self._finished_size)
-
-                return True
 
             raise(RetriesExceededError("download retries exceeded"))
 
@@ -246,23 +278,29 @@ class FileTransfer(object):
 
     def _upload_one_part(self, bucket, key, upload_id, extra_args):
         def _do_upload(chunk):
-            for r in range(0, 10):
-                response = self.client.upload_part(
-                    Bucket=bucket, Key=key,
-                    UploadId=upload_id, PartNumber=chunk.part_number,
-                    Body=chunk.read(), **extra_args)
-                etag = response['ETag']
-                if response['ResponseMetadata']['HTTPStatusCode'] \
-                        is not 200:
-                    continue
-                self._add_finished_size(chunk.size)
-                LOGGER.debug("upload %s %s of %s" % (
+            t = 1  # sleep time 1,2,4,8,16...120
+            for r in range(0, self._retry):
+                try:
+                    response = self.client.upload_part(
+                        Bucket=bucket, Key=key,
+                        UploadId=upload_id, PartNumber=chunk.part_number,
+                        Body=chunk.read(), **extra_args)
+                    etag = response['ETag']
+                    self._add_finished_size(chunk.size)
+                    LOGGER.debug("upload %s %s of %s" % (
                              key, chunk.part_number, self._parts_number))
 
-                if self._progress:
-                    self._callback(self._total_size, self._finished_size)
+                    if self._progress:
+                        self._callback(self._total_size, self._finished_size)
 
-                return {'ETag': etag, 'PartNumber': chunk.part_number}
+                    return {'ETag': etag, 'PartNumber': chunk.part_number}
+                except:
+                    LOGGER.warn("retry %s part %s, %s of %s" % (
+                             key, chunk.part_number, r+1, self._retry))
+                    self._sleep_with(t)
+                    t = t + 1
+                    continue
+
             raise(RetriesExceededError("upload retries exceeded"))
 
         return _do_upload
@@ -271,6 +309,10 @@ class FileTransfer(object):
         if rlock.acquire():
             self._finished_size += size
             rlock.release()
+
+    def _sleep_with(self, t):
+        time.sleep(min(2**t, 120))
+
 
 
 def parse_args():
@@ -291,7 +333,7 @@ def parse_args():
 
 def upload_callback(total_size, finished_size):
     assert total_size > 0
-    sys.stdout.write("%2.4f%%\r" % (finished_size*100/float(total_size)))
+    sys.stdout.write("\r%2.2f%%" % (finished_size*100/float(total_size)))
     sys.stdout.flush()
 
 
