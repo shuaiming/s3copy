@@ -18,6 +18,7 @@ import shutil
 import logging
 import argparse
 
+from hashlib import md5
 from threading import RLock
 from collections import namedtuple
 from logging.handlers import SysLogHandler
@@ -117,7 +118,7 @@ class FileChunkReader(object):
         return self._chunks
 
     def get_chunk_size(self):
-        return sefl._chunk_size
+        return self._chunk_size
 
     def get_size(self):
         return self._file_size
@@ -164,7 +165,7 @@ class FileChunkWriter(object):
         return self._chunks
 
     def get_chunk_size(self):
-        return sefl._chunk_size
+        return self._chunk_size
 
     def commit_write(self):
         shutil.move("%s.download" % self._filename, self._filename)
@@ -201,6 +202,34 @@ class FileTransfer(object):
         else:
             return False
 
+    def verify_file(self, src, dest):
+        return (self._calculate_etag(src), self._calculate_etag(dest))
+
+    def etag_file(self, dest):
+        return self._calculate_etag(dest)
+
+    def _calculate_etag(self, dest):
+        etag = None
+
+        def md5_cal(chunk):
+            self._add_finished_size(chunk.size)
+            if self._progress:
+                self._callback(self._total_size, self._finished_size)
+            return md5(chunk.read()).digest()
+
+        if dest.startswith(PREFIX_S3):
+            bucket, key = self._split_s3uri(dest)
+            response = self.client.head_object(Bucket=bucket, Key=key)
+            etag = str(response['ETag']).strip('"')
+        else:
+            reader = FileChunkReader(dest)
+            self._total_size = reader.get_size()
+            chunks = reader.get_chunks()
+            b = reduce(lambda x, y: x+y, map(md5_cal, chunks))
+            etag = "%s-%s" % (md5(b).hexdigest(), len(chunks))
+
+        return etag
+
     def _split_s3uri(self, s3uri):
         m = re.match('^%s(.*?)/(.*)$' % PREFIX_S3, s3uri)
         assert m is not None
@@ -228,6 +257,7 @@ class FileTransfer(object):
             executor.shutdown()
             LOGGER.error("abort download %s %s %s" % (bucket, key, dest))
             raise(error)
+        return True
 
     def _download_one_part(self, bucket, key, extra_args):
         def _do_download(chunk):
@@ -276,7 +306,7 @@ class FileTransfer(object):
             if self._progress:
                 self._callback(self._total_size, self._finished_size)
             LOGGER.info("upload %s finished" % key)
-            return
+            return True
 
         response = self.client.create_multipart_upload(
             Bucket=bucket, Key=key, **extra_args)
@@ -300,6 +330,7 @@ class FileTransfer(object):
             self.client.abort_multipart_upload(
                 Bucket=bucket, Key=key, UploadId=upload_id)
             raise(error)
+        return True
 
     def _upload_one_part(self, bucket, key, upload_id, extra_args):
         def _do_upload(chunk):
@@ -339,36 +370,69 @@ class FileTransfer(object):
         time.sleep(min(2**t, 120))
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description='upload and download file for aws s3')
-
-    parser.add_argument(
-        '-r', '--retry', type=int, help='retries for each chunk')
-    parser.add_argument('-p', '--progress', action='store_true',
-                        help='show transfer progress in percentage')
-    parser.add_argument(
-        '-t', '--threads', type=int, help='number of worker threads')
-    parser.add_argument('src')
-    parser.add_argument('dest')
-
-    return parser.parse_args()
-
-
 def upload_callback(total_size, finished_size):
     assert total_size > 0
     sys.stdout.write("\r%2.2f%%" % (finished_size*100/float(total_size)))
     sys.stdout.flush()
 
 
-if "__main__" == __name__:
-    args = parse_args()
+def s3copy():
+    parser = argparse.ArgumentParser(
+        description='upload and download file for aws s3')
+    parser.add_argument(
+        '-r', '--retry', type=int, help='retries for each chunk')
+    parser.add_argument('-p', '--progress', action='store_true',
+                        help='show transfer progress in percentage')
+    parser.add_argument(
+            '-v', '--verify', action='store_true',
+            help='verify local and remote files with s3 object etag')
+    parser.add_argument(
+            '-t', '--threads', type=int, help='number of worker threads')
+    parser.add_argument('src', nargs='?')
+    parser.add_argument('dest')
 
-    src, dest = args.src, args.dest
+    parser.add_argument('-e', '--etag', action='store_true',
+                        help='get Etag of a object')
+
+    args = parser.parse_args()
+
+    src = args.src
+    dest = args.dest
+    etag = args.etag
+    verify = args.verify
+    progress = args.progress
+
     retry = args.retry if args.retry else 10
-    progress = args.progress if args.progress else False
     threads = args.threads if args.threads else 5
 
     transfer = FileTransfer(retry, progress, threads, upload_callback)
-    transfer.copy_file(src, dest)
-    print
+
+    if etag:
+        etag = transfer.etag_file(dest)
+        print "successful. Etag:\n%s %s" % (etag, dest)
+        sys.exit(0)
+
+    if verify:
+        etag = transfer.verify_file(src, dest)
+        if etag[0] == etag[1] and etag[0] != None:
+            print "successful. Etag:\n%s both" % etag[0]
+            sys.exit(0)
+        else:
+            print "failed. Etag:\n%s %s\n%s %s" % (
+                    etag[0], src, etag[1], dest)
+            sys.exit(-1)
+
+    if not src:
+        parser.print_help()
+        sys.exit(0)
+
+    print "copy %s to %s" % (src, dest)
+    if transfer.copy_file(src, dest):
+        print "successful."
+
+if "__main__" == __name__:
+    try:
+        s3copy()
+    except Exception as err:
+        print err
+        sys.exit(-1)
