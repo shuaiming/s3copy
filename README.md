@@ -11,11 +11,11 @@
     optional arguments:
     -h, --help            show this help message and exit
     -r RETRY, --retry RETRY
-                            retries for each chunk
+                          retries for each chunk
     -p, --progress        show transfer progress in percentage
     -v, --verify          verify local and remote files with s3 object etag
     -t THREADS, --threads THREADS
-                            number of worker threads
+                          number of worker threads
     -e, --etag            get Etag of a object
 # todo
 *	working with io streams to reduce memory usage.
