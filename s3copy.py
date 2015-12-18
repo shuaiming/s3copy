@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# awsfile.py
+#
 # before upload or download a file:
 #     export AWS_ACCESS_KEY_ID='key_id'
 #     export AWS_SECRET_ACCESS_KEY='key'
@@ -102,6 +102,9 @@ class FileChunkReader(object):
 
     def _gen_chunks(self):
         parts_num = int(self._file_size / float(self._chunk_size))
+        if self._file_size == self._chunk_size:
+            parts_num = 0
+
         for i in range(0, parts_num):
             starter = self._chunk_size * i
             self._chunks.append(self._reader(starter, self._chunk_size))
@@ -112,6 +115,9 @@ class FileChunkReader(object):
 
     def get_chunks(self):
         return self._chunks
+
+    def get_chunk_size(self):
+        return sefl._chunk_size
 
     def get_size(self):
         return self._file_size
@@ -144,6 +150,8 @@ class FileChunkWriter(object):
 
     def _gen_chunks(self):
         parts_num = int(self._file_size / float(self._chunk_size))
+        if self._file_size == self._chunk_size:
+            parts_num = 0
         for i in range(0, parts_num):
             starter = self._chunk_size * i
             self._chunks.append(self._writer(starter, self._chunk_size))
@@ -154,6 +162,9 @@ class FileChunkWriter(object):
 
     def get_chunks(self):
         return self._chunks
+
+    def get_chunk_size(self):
+        return sefl._chunk_size
 
     def commit_write(self):
         shutil.move("%s.download" % self._filename, self._filename)
@@ -202,7 +213,7 @@ class FileTransfer(object):
         write_file = "%s/%s" % (dest, key.split('/')[-1]) \
                      if os.path.isdir(dest) else dest
         file_size = int(self.client.head_object(
-            Bucket=bucket, Key=key, **extra_args)['ContentLength'])
+                Bucket=bucket, Key=key, **extra_args)['ContentLength'])
         self._total_size = file_size
         writer = FileChunkWriter(write_file, file_size)
         chunks = writer.get_chunks()
@@ -254,6 +265,19 @@ class FileTransfer(object):
         chunks = reader.get_chunks()
         self._parts_number = len(chunks)
 
+        #  upload small file by using put_object.
+        if self._parts_number == 1:
+            chunk = chunks[0]
+            LOGGER.info("%s is not need using MultipartUpload." % key)
+            self.client.put_object(Bucket=bucket, Key=key,
+                                   Body=chunk.read(), **extra_args)
+
+            self._add_finished_size(chunk.size)
+            if self._progress:
+                self._callback(self._total_size, self._finished_size)
+            LOGGER.info("upload %s finished" % key)
+            return
+
         response = self.client.create_multipart_upload(
             Bucket=bucket, Key=key, **extra_args)
         upload_id = response['UploadId']
@@ -268,6 +292,7 @@ class FileTransfer(object):
             self.client.complete_multipart_upload(
                 Bucket=bucket, Key=key, UploadId=upload_id,
                 MultipartUpload={'Parts': parts})
+            LOGGER.info("upload %s finished" % key)
 
         except (KeyboardInterrupt, Exception) as error:
             executor.shutdown()
@@ -312,7 +337,6 @@ class FileTransfer(object):
 
     def _sleep_with(self, t):
         time.sleep(min(2**t, 120))
-
 
 
 def parse_args():
