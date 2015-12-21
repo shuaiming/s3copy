@@ -242,7 +242,7 @@ class FileTransfer(object):
         write_file = "%s/%s" % (dest, key.split('/')[-1]) \
                      if os.path.isdir(dest) else dest
         file_size = int(self.client.head_object(
-                Bucket=bucket, Key=key, **extra_args)['ContentLength'])
+            Bucket=bucket, Key=key, **extra_args)['ContentLength'])
         self._total_size = file_size
         writer = FileChunkWriter(write_file, file_size)
         chunks = writer.get_chunks()
@@ -280,7 +280,7 @@ class FileTransfer(object):
                     return True
                 except:
                     LOGGER.warn("retry %s part %s, %s of %s" % (
-                            key, chunk.range_param, r+1, self._retry))
+                        key, chunk.range_param, r+1, self._retry))
                     self._sleep_with(t)
                     t = t + 1
                     continue
@@ -344,7 +344,7 @@ class FileTransfer(object):
                     etag = response['ETag']
                     self._add_finished_size(chunk.size)
                     LOGGER.debug("upload %s %s of %s" % (
-                             key, chunk.part_number, self._parts_number))
+                        key, chunk.part_number, self._parts_number))
 
                     if self._progress:
                         self._callback(self._total_size, self._finished_size)
@@ -352,7 +352,7 @@ class FileTransfer(object):
                     return {'ETag': etag, 'PartNumber': chunk.part_number}
                 except:
                     LOGGER.warn("retry %s part %s, %s of %s" % (
-                             key, chunk.part_number, r+1, self._retry))
+                        key, chunk.part_number, r+1, self._retry))
                     self._sleep_with(t)
                     t = t + 1
                     continue
@@ -384,10 +384,10 @@ def s3copy():
     parser.add_argument('-p', '--progress', action='store_true',
                         help='show transfer progress in percentage')
     parser.add_argument(
-            '-v', '--verify', action='store_true',
-            help='verify local and remote files with s3 object etag')
+        '-v', '--verify', action='store_true',
+        help='verify local and remote files with s3 object etag')
     parser.add_argument(
-            '-t', '--threads', type=int, help='number of worker threads')
+        '-t', '--threads', type=int, help='number of worker threads')
     parser.add_argument('src', nargs='?')
     parser.add_argument('dest')
 
@@ -414,12 +414,12 @@ def s3copy():
 
     if verify:
         etag = transfer.verify_file(src, dest)
-        if etag[0] == etag[1] and etag[0] != None:
+        if etag[0] == etag[1] and etag[0] is not None:
             print "successful. Etag:\n%s both" % etag[0]
             sys.exit(0)
         else:
             print "failed. Etag:\n%s %s\n%s %s" % (
-                    etag[0], src, etag[1], dest)
+                etag[0], src, etag[1], dest)
             sys.exit(-1)
 
     if not src:
