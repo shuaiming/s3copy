@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # before upload or download a file:
 #     export AWS_ACCESS_KEY_ID='key_id'
@@ -6,24 +6,24 @@
 #     export AWS_DEFAULT_REGION='region'
 # or
 #     aws configure
-#
 
 
+import argparse
+import boto3
+import logging
 import os
 import re
+import shutil
 import sys
 import time
-import boto3
-import shutil
-import logging
-import argparse
 
-from hashlib import md5
-from threading import RLock
-from collections import namedtuple
-from logging.handlers import SysLogHandler
-from concurrent.futures import ThreadPoolExecutor
 from boto3.exceptions import RetriesExceededError
+from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
+from hashlib import md5
+from logging.handlers import SysLogHandler
+from threading import RLock
+from functools import reduce
 
 rlock = RLock()
 LOGGER = logging.getLogger(__name__)
@@ -48,7 +48,7 @@ MAX_CHUNK_SIZE = 500 * MB
 MAX_S3_FILE_SIZE = 5 * TB
 
 
-def _GET_CHUNK_SIZE(file_size):
+def _get_trunk_size(file_size):
     """
     +------------+------------+---------------+
     | file_size  | chunk_size | parts         |
@@ -82,7 +82,7 @@ class FileChunkReader(object):
         self._callback = callback
         self._file_handler = open(self._filename, 'rb')
         self._file_size = int(os.fstat(self._file_handler.fileno()).st_size)
-        self._chunk_size = _GET_CHUNK_SIZE(self._file_size)
+        self._chunk_size = _get_trunk_size(self._file_size)
 
         self._chunks = []
         self._gen_chunks()
@@ -128,7 +128,7 @@ class FileChunkWriter(object):
     def __init__(self, filename, size, callback=None):
         self._filename = filename
         self._file_size = size
-        self._chunk_size = _GET_CHUNK_SIZE(self._file_size)
+        self._chunk_size = _get_trunk_size(self._file_size)
         self._file_handler = open("%s.download" % self._filename, 'wb')
         self._file_handler.seek(self._file_size - 1)
         self._file_handler.write('\0')
@@ -225,7 +225,7 @@ class FileTransfer(object):
             reader = FileChunkReader(dest)
             self._total_size = reader.get_size()
             chunks = reader.get_chunks()
-            b = reduce(lambda x, y: x+y, map(md5_cal, chunks))
+            b = reduce(lambda x, y: x+y, list(map(md5_cal, chunks)))
             etag = "%s-%s" % (md5(b).hexdigest(), len(chunks))
 
         return etag
@@ -250,7 +250,7 @@ class FileTransfer(object):
         executor = ThreadPoolExecutor(max_workers=self._threads)
         do_download = self._download_one_part(bucket, key, extra_args)
         try:
-            map(lambda x: x, executor.map(do_download, chunks))
+            list([x for x in executor.map(do_download, chunks)])
             writer.commit_write()
         except (KeyboardInterrupt, Exception) as error:
             writer.abort_write()
@@ -278,14 +278,14 @@ class FileTransfer(object):
                         self._callback(self._total_size, self._finished_size)
 
                     return True
-                except:
+                except Exception:
                     LOGGER.warn("retry %s part %s, %s of %s" % (
                         key, chunk.range_param, r+1, self._retry))
                     self._sleep_with(t)
                     t = t + 1
                     continue
 
-            raise(RetriesExceededError("download retries exceeded"))
+            raise RetriesExceededError("download retries exceeded")
 
         return _do_download
 
@@ -318,7 +318,7 @@ class FileTransfer(object):
                                               upload_id, extra_args)
 
             # multi upload process.
-            parts = map(lambda x: x, executor.map(do_upload, chunks))
+            parts = [x for x in executor.map(do_upload, chunks)]
             self.client.complete_multipart_upload(
                 Bucket=bucket, Key=key, UploadId=upload_id,
                 MultipartUpload={'Parts': parts})
@@ -350,14 +350,14 @@ class FileTransfer(object):
                         self._callback(self._total_size, self._finished_size)
 
                     return {'ETag': etag, 'PartNumber': chunk.part_number}
-                except:
+                except Exception:
                     LOGGER.warn("retry %s part %s, %s of %s" % (
                         key, chunk.part_number, r+1, self._retry))
                     self._sleep_with(t)
                     t = t + 1
                     continue
 
-            raise(RetriesExceededError("upload retries exceeded"))
+            raise RetriesExceededError("upload retries exceeded")
 
         return _do_upload
 
@@ -409,30 +409,31 @@ def s3copy():
 
     if etag:
         etag = transfer.etag_file(dest)
-        print "successful. Etag:\n%s %s" % (etag, dest)
+        print("successful. Etag:\n%s %s" % (etag, dest))
         sys.exit(0)
 
     if verify:
         etag = transfer.verify_file(src, dest)
         if etag[0] == etag[1] and etag[0] is not None:
-            print "successful. Etag:\n%s both" % etag[0]
+            print("successful. Etag:\n%s both" % etag[0])
             sys.exit(0)
         else:
-            print "failed. Etag:\n%s %s\n%s %s" % (
-                etag[0], src, etag[1], dest)
+            print("failed. Etag:\n%s %s\n%s %s" % (
+                etag[0], src, etag[1], dest))
             sys.exit(-1)
 
     if not src:
         parser.print_help()
         sys.exit(0)
 
-    print "copy %s to %s" % (src, dest)
+    print("copy %s to %s" % (src, dest))
     if transfer.copy_file(src, dest):
-        print "successful."
+        print("successful.")
+
 
 if "__main__" == __name__:
     try:
         s3copy()
     except Exception as err:
-        print err
+        print(err)
         sys.exit(-1)
